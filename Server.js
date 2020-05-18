@@ -2,14 +2,27 @@ var fs = require('fs-extra');
 var forge = require('node-forge');
 var onlyPath = require('path');
 var LinvoDB = require("linvodb3");
-var zip = new require('node-zip')();
+var archiver = require('archiver');
+var os = require('os');
+var process = require('process');
+var getAppDataPath = require('appdata-path');
 
-rootData = "/Users/guest/Library/Containers/com.readmoo.readmoodesktop/Readmoo/";
-pathBook = "/Users/guest/Library/Containers/com.readmoo.readmoodesktop/Readmoo/api/book/"
-localStoragePath = "/Users/guest/Library/Application Support/Readmoo/Local Storage/app_readmoo_0.localstorage";
+var appDataPath = getAppDataPath();
+
+var rootData, pathBook, localStoragePath;
+
+if (process.platform === "win32") {
+  rootData = onlyPath.join(os.homedir(), 'Readmoo');
+  pathBook = onlyPath.join(rootData, 'api', 'book');
+  localStoragePath = onlyPath.join(appDataPath, '..', 'Local/Readmoo/Local Storage/app_readmoo_0.localstorage');
+} else {
+  rootData = onlyPath.join(appDataPath, '..', 'Containers/com.readmoo.readmoodesktop/Readmoo/');
+  pathBook = onlyPath.join(rootData, 'api', 'book');
+  localStoragePath = onlyPath.join(appDataPath, "Readmoo/Local Storage/app_readmoo_0.localstorage");
+}
 
 LinvoDB.defaults.store = { db: require("medeadown") };
-LinvoDB.dbPath = "./db/";
+LinvoDB.dbPath = onlyPath.join(rootData, "db/");
 
 var encryptionDB = new LinvoDB("encryption", {}, {});
 
@@ -23,9 +36,10 @@ var encryptionMethods = {
 var sqlite = require('better-sqlite3');
 var lsDB = new sqlite(localStoragePath);
 var localStorageDatas = lsDB.prepare("SELECT value FROM ItemTable WHERE key = 'rsa_privateKey'").all();
-var mypem = localStorageDatas[0].value;
-mypem = mypem.toString().replace(/(\r\n|\n|\r)/gm, "");
-console.log(mypem);
+var kpr_pem = localStorageDatas[0].value.toString('ucs2').replace(/(\r\n|\n|\r)/gm, "");
+
+console.log('[INFO] PEM extracted.');
+//console.log(kpr_pem);
 
 function aes256Decrypt(aesKey, fetchCallback, input, file, path){
 
@@ -43,7 +57,7 @@ function aes256Decrypt(aesKey, fetchCallback, input, file, path){
           var padding_length = output.last();
           var plaintextBuffer = output.truncate(padding_length);
           if (type !== 'css') {
-            var nodeBuffer = new Buffer(plaintextBuffer.getBytes(), 'binary');
+            var nodeBuffer = Buffer.from(plaintextBuffer.getBytes(), 'binary');
             fetchCallback(nodeBuffer, plaintextBuffer.length());
           } else {
             fetchCallback(plaintextBuffer.toString(), plaintextBuffer.length());
@@ -59,13 +73,13 @@ var decryptDocument = function(encryptionInfo, retrivalObj, input, file, path, f
 
   var cipher = retrivalObj.cipher
       pki = forge.pki
-      kpr_pem = mypem
-      kpr = pki.privateKeyFromPem(kpr_pem)
+      let str = kpr_pem.replace(/(\r\n|\n|\r)/gm, '').replace(/^\s*/, '')
+      kpr = pki.privateKeyFromPem(str)
       ciphertext = forge.util.decode64(cipher)
       aesKey = kpr.decrypt(ciphertext)
       //TODO get decipher from Buffer directly
       encryptionAlgorithm = encryptionMethods[encryptionInfo.encryptionAlgorithm];
-//console.log("AESKEY: ", aesKey);
+
   if(encryptionAlgorithm)
       encryptionAlgorithm.call(this, aesKey, fetchCallback, input, file, path);
   else
@@ -95,9 +109,9 @@ var openEncrypedBook = function(bookid, encryptedPath, encryptionTable, saveFile
       retrivalObj,
       _path = pathBook;
 
-  encryptionPath = pathBook + bookid + '/META-INF/'+'encryption.xml';
+  encryptionPath = onlyPath.join(pathBook, bookid, 'META-INF', 'encryption.xml');
 
-  _path += bookid + '/' + encryptedPath; // osx32/64
+  _path = onlyPath.join(_path, bookid, encryptedPath); // osx32/64
 
   encryptionInfo = encryptionTable.encryptions[encryptedPath];
   if (encryptionInfo)
@@ -113,11 +127,12 @@ var openEncrypedBook = function(bookid, encryptedPath, encryptionTable, saveFile
 
 
 var decipherBook = function(bookid, encryptionTable, files) {
-  var dir = process.cwd() + "/books/" + bookid;
-  fs.copySync(pathBook+bookid, dir)
+  console.log('[INFO] Decrypting', bookid, '...');
+  var dir = onlyPath.join(process.cwd(), 'books', bookid);
+  fs.copySync(onlyPath.join(pathBook, bookid), dir);
 
   var saveFile = function(data, bookid, path) {
-    saveFilePath = dir+"/"+path;
+    saveFilePath = onlyPath.join(dir, path);
     targetDir = onlyPath.dirname(saveFilePath);
     try {
       fs.mkdirSync(targetDir, { recursive: true });
@@ -133,10 +148,26 @@ var decipherBook = function(bookid, encryptionTable, files) {
     openEncrypedBook(bookid, key, encryptionTable, saveFile);
   }
 
+  fs.removeSync(onlyPath.join(dir, 'META-INF', 'encryption.xml'));
+  var epubPath = `${dir}.epub`;
+  var output = fs.createWriteStream(epubPath);
+  var archive = archiver('zip', {
+    zlib: { level: 9 } // Sets the compression level.
+  });
+
+  archive.pipe(output);
+  archive.directory(dir, false);
+  archive.finalize();
+
+  output.on('close', function() {
+    console.log('[INFO]', archive.pointer(), 'bytes written.');
+  });
+
 };
 
 var getTableOfBooks = function(){
   encryptionDB.find({}, function(err, docs){
+    console.log('[INFO]', docs.length, 'items found.');
     docs.forEach(function(doc){
       encryptionTable = JSON.parse(doc.table);
       var bookid, files;
@@ -148,12 +179,9 @@ var getTableOfBooks = function(){
   });
 };
 
-var bookDir = process.cwd() + "/books"
+var bookDir = onlyPath.join(process.cwd(), '/books')
 if (!fs.existsSync(bookDir)){
   fs.mkdirSync(bookDir);
 }
 
 getTableOfBooks();
-
-// Delete encryption.xml
-// Zip the files and rename it to *.epub 
